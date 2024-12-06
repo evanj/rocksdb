@@ -10,6 +10,7 @@
 #include <cstring>
 
 #include "db/db_test_util.h"
+#include "db/version_edit_handler.h"
 #include "options/options_helper.h"
 #include "port/stack_trace.h"
 #include "rocksdb/filter_policy.h"
@@ -3939,6 +3940,247 @@ TEST_P(DBBasicTestTrackWal, DoNotTrackObsoleteWal) {
   // reopen will fail because the WALs are missing from disk.
   ASSERT_OK(TryReopenWithColumnFamilies({"default", "cf"}, options));
   Destroy(options);
+}
+
+struct ParsedWalAddition {
+  explicit ParsedWalAddition(size_t log_number, size_t synced_size_in_bytes)
+      : log_number_(log_number), synced_size_in_bytes_(synced_size_in_bytes) {}
+
+  size_t log_number_;
+  size_t synced_size_in_bytes_;
+};
+
+class ParseWalAdditionHandler : public VersionEditHandler {
+ public:
+  ParseWalAdditionHandler(std::vector<ColumnFamilyDescriptor> column_families,
+                          VersionSet* version_set)
+      : VersionEditHandler(
+            /*read_only=*/true, column_families, version_set,
+            /*track_found_and_missing_files=*/false,
+            /*no_error_if_files_missing=*/false, /*io_tracer*/ nullptr,
+            ReadOptions(),
+            /*skip_load_table_files=*/true,
+            /*allow_incomplete_valid_version=*/false,
+            /*epoch_number_requirement=*/EpochNumberRequirement::kMustPresent),
+        iteration_status_(Status::OK()) {}
+
+  ~ParseWalAdditionHandler() override {}
+
+  Status ApplyVersionEdit(VersionEdit& edit, ColumnFamilyData** cfd) override {
+    if (!edit.IsWalAddition()) {
+      return Status::OK();
+    }
+
+    // in theory this could be > 1, but the test should only create 1
+    assert(edit.GetWalAdditions().size() == 1);
+
+    for (const auto& addition : edit.GetWalAdditions()) {
+      auto metadata = addition.GetMetadata();
+      assert(metadata.HasSyncedSize());
+      wal_additions_.emplace_back(ParsedWalAddition(
+          addition.GetLogNumber(), metadata.GetSyncedSizeInBytes()));
+    }
+
+    return VersionEditHandler::ApplyVersionEdit(edit, cfd);
+  }
+
+  void CheckIterationResult(const log::Reader& /*unused*/, Status* s) override {
+    if (!s->ok()) {
+      iteration_status_ = *s;
+    }
+  }
+
+  Status iteration_status_;
+  std::vector<ParsedWalAddition> wal_additions_;
+};
+
+// This is extracted from ManifestDump and VersionSet::DumpManifest
+Status parse_wal_additions_from_manifest(
+    DBImpl* db, std::vector<ParsedWalAddition>* destination) {
+  std::vector<std::string> files;
+  uint64_t manifest_file_size = 0;
+  Status s = db->GetLiveFiles(files, &manifest_file_size, /*flush*/ false);
+  if (!s.ok()) {
+    return s;
+  }
+
+  static const char MANIFEST_PREFIX[] = "MANIFEST-";
+  std::string manifest_path;
+  for (const auto& file : files) {
+    if (file.find(MANIFEST_PREFIX) == std::string::npos) {
+      continue;
+    }
+
+    auto db_dir = db->GetName();
+    manifest_path = db_dir + file;
+  }
+  if (manifest_path.empty()) {
+    return Status::InvalidArgument("No MANIFEST file found");
+  }
+
+  // Open the specified manifest file.
+  std::unique_ptr<SequentialFileReader> file_reader;
+  {
+    std::unique_ptr<FSSequentialFile> file;
+    const std::shared_ptr<FileSystem>& fs = db->GetEnv()->GetFileSystem();
+    FileOptions file_options;
+    s = fs->NewSequentialFile(manifest_path,
+                              fs->OptimizeForManifestRead(file_options), &file,
+                              nullptr);
+    if (!s.ok()) {
+      return s;
+    }
+    file_reader = std::make_unique<SequentialFileReader>(
+        std::move(file), manifest_path, db->GetDBOptions().log_readahead_size);
+  }
+
+  // Create a VersionSet copied from DumpManifestFile
+  const std::string dummy_db_name("dummy");
+  Options default_db_options;
+  EnvOptions sopt;
+  std::shared_ptr<Cache> tc(
+      NewLRUCache(default_db_options.max_open_files - 10,
+                  default_db_options.table_cache_numshardbits));
+  // Notice we are using the default options not through SanitizeOptions(),
+  // if VersionSet::DumpManifest() depends on any option done by
+  // SanitizeOptions(), we need to initialize it manually.
+  default_db_options.db_paths.emplace_back(dummy_db_name, 0);
+  default_db_options.num_levels = 64;
+  WriteController wc(default_db_options.delayed_write_rate);
+  WriteBufferManager wb(default_db_options.db_write_buffer_size);
+  ImmutableDBOptions immutable_db_options(default_db_options);
+  VersionSet version_set(dummy_db_name, &immutable_db_options, sopt, tc.get(),
+                         &wb, &wc,
+                         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
+                         /*db_id=*/"", /*db_session_id=*/"",
+                         default_db_options.daily_offpeak_time_utc,
+                         /*error_handler=*/nullptr, /*read_only=*/true);
+
+  destination->clear();
+
+  // only list the default column family
+  std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.push_back(
+      ColumnFamilyDescriptor(kDefaultColumnFamilyName, ColumnFamilyOptions()));
+  ParseWalAdditionHandler handler(column_families, &version_set);
+
+  log::Reader reader(nullptr, std::move(file_reader), nullptr /* reporter */,
+                     true /* checksum */, 0 /* log_number */);
+  handler.Iterate(reader, &s);
+
+  // copy the result out
+  destination->swap(handler.wal_additions_);
+
+  if (!s.ok()) {
+    return s;
+  }
+  return handler.iteration_status_;
+}
+
+enum TestTrackWalWriteMode {
+  kTestTrackWalWriteModeSyncFalse,
+  kTestTrackWalWriteModeFlushManually,
+  kTestTrackWalWriteModeSyncTrue,
+};
+
+// When tracking WALs in MANIFEST, we should record each one ONCE, when the WAL
+// is closed. Verify that happens with a variety of different modes.
+class DBTestTrackWalCountRecords
+    : public DBTestBase,
+      public testing::WithParamInterface<
+          std::tuple<TestTrackWalWriteMode, bool>> {
+ public:
+  DBTestTrackWalCountRecords()
+      : DBTestBase("db_basic_test_track_count_records", /*env_do_fsync=*/false),
+        write_mode_(std::get<0>(GetParam())),
+        atomic_flush_(std::get<1>(GetParam())) {
+    Options options = CurrentOptions();
+    options.create_if_missing = true;
+    options.track_and_verify_wals_in_manifest = true;
+    options.atomic_flush = atomic_flush_;
+    // extremely small so WALs are created frequently
+    // adjusted to 64kiB by ColumnFamilyOptions::SanitizeOptions
+    options.write_buffer_size = 100;
+
+    DestroyAndReopen(options);
+  }
+
+  const TestTrackWalWriteMode write_mode_;
+  const bool atomic_flush_;
+};
+
+std::string DBTestTrackWalCountRecordsParamToString(
+    const testing::TestParamInfo<DBTestTrackWalCountRecords::ParamType>&
+        value) {
+  TestTrackWalWriteMode write_mode = std::get<0>(value.param);
+  bool atomic_flush = std::get<1>(value.param);
+
+  std::string result;
+  switch (write_mode) {
+    case kTestTrackWalWriteModeSyncFalse:
+      result = "sync_false";
+      break;
+    case kTestTrackWalWriteModeFlushManually:
+      result = "flush_after_write";
+      break;
+    case kTestTrackWalWriteModeSyncTrue:
+      result = "sync_true";
+      break;
+    default:
+      fprintf(stderr, "unsupported TestTrackWalWriteMode value=%d\n",
+              write_mode);
+      abort();
+      break;
+  }
+
+  result += "_atomic_flush_";
+  result += (atomic_flush ? "true" : "false");
+  return result;
+}
+
+INSTANTIATE_TEST_CASE_P(
+    DBTestTrackWalCountRecords, DBTestTrackWalCountRecords,
+    ::testing::Combine(::testing::Values(kTestTrackWalWriteModeSyncFalse,
+                                         kTestTrackWalWriteModeFlushManually,
+                                         kTestTrackWalWriteModeSyncTrue),
+                       ::testing::Values(false, true)),
+    DBTestTrackWalCountRecordsParamToString);
+
+TEST_P(DBTestTrackWalCountRecords, CountWalAdditions) {
+  WriteOptions write_opts;
+  if (write_mode_ == kTestTrackWalWriteModeSyncFalse) {
+    write_opts.sync = false;
+  } else if (write_mode_ == kTestTrackWalWriteModeSyncTrue) {
+    write_opts.sync = true;
+  }
+
+  // enough writes to use 4 WALs (4, 8, 10, 12): this ensures there is a switch
+  // plus additional writes, which previously caused problems with sync writes
+  // particularly with atomic_flush=false
+  const size_t NUM_WRITES = 7000;
+  const size_t EXPECTED_WAL_ADDITIONS = 3;
+  for (size_t i = 0; i < NUM_WRITES; i++) {
+    ASSERT_OK(
+        db_->Put(write_opts, "k" + std::to_string(i), "v" + std::to_string(i)));
+    if (write_mode_ == kTestTrackWalWriteModeFlushManually) {
+      ASSERT_OK(db_->FlushWAL(true));
+    }
+  }
+
+  // Read the WalAddition from the manifest. There should be 3
+  std::vector<ParsedWalAddition> wal_additions;
+  ASSERT_OK(parse_wal_additions_from_manifest(dbfull(), &wal_additions));
+
+  // we should see 3 WAL additions: 4, 8, 10 which are all finished. The DB will
+  // be using 12 but that is still being used so it is not included in the
+  // MANIFEST. For sync=false atomic_flush=false there are zero WAL additions.
+  printf("DEBUGGING wal_additions.size()=%zu write_mode=%d atomic_flush=%d\n",
+         wal_additions.size(), write_mode_, atomic_flush_);
+  if (write_mode_ == kTestTrackWalWriteModeSyncFalse && !atomic_flush_) {
+    ASSERT_EQ(wal_additions.size(), 0);
+  } else {
+    ASSERT_EQ(wal_additions.size(), EXPECTED_WAL_ADDITIONS);
+  }
 }
 
 INSTANTIATE_TEST_CASE_P(DBBasicTestTrackWal, DBBasicTestTrackWal,
