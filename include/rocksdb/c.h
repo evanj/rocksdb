@@ -1251,6 +1251,25 @@ extern ROCKSDB_LIBRARY_API void rocksdb_options_set_write_buffer_manager(
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_sst_file_manager(
     rocksdb_options_t* opt, rocksdb_sst_file_manager_t* sfm);
 
+/**
+ * Enum values for BlockBasedTableOptions::PrepopulateBlockCache.
+ */
+enum {
+  /** Disable prepopulate block cache. */
+  rocksdb_prepopulate_block_cache_disable = 0,
+  /** Prepopulate blocks during flush only. */
+  rocksdb_prepopulate_block_cache_flush_only = 1
+};
+
+/** Sets TableOptions.prepopulate_block_cache. */
+extern ROCKSDB_LIBRARY_API void
+rocksdb_block_based_options_set_prepopulate_block_cache(
+    rocksdb_block_based_table_options_t* opt, int val);
+/** Gets TableOptions.prepopulate_block_cache. */
+extern ROCKSDB_LIBRARY_API int
+rocksdb_block_based_options_get_prepopulate_block_cache(
+    rocksdb_block_based_table_options_t* opt);
+
 /* Flush job info */
 
 extern ROCKSDB_LIBRARY_API const char* rocksdb_flushjobinfo_cf_name(

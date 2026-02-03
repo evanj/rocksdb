@@ -2877,6 +2877,15 @@ int main(int argc, char** argv) {
     rocksdb_options_set_prepopulate_blob_cache(o, 1 /* flush only */);
     CheckCondition(1 == rocksdb_options_get_prepopulate_blob_cache(o));
 
+    rocksdb_block_based_table_options_t* table_opts =
+        rocksdb_block_based_options_create();
+    rocksdb_block_based_options_set_prepopulate_block_cache(
+        table_opts, rocksdb_prepopulate_block_cache_flush_only);
+    CheckCondition(rocksdb_prepopulate_block_cache_flush_only ==
+                   rocksdb_block_based_options_get_prepopulate_block_cache(
+                       table_opts));
+    rocksdb_block_based_options_destroy(table_opts);
+
     // Create a copy that should be equal to the original.
     rocksdb_options_t* copy;
     copy = rocksdb_options_create_copy(o);

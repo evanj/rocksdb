@@ -3782,6 +3782,17 @@ void rocksdb_block_based_options_set_pin_top_level_index_and_filter(
   options->rep.pin_top_level_index_and_filter = v;
 }
 
+void rocksdb_block_based_options_set_prepopulate_block_cache(
+    rocksdb_block_based_table_options_t* opt, int val) {
+  opt->rep.prepopulate_block_cache =
+      static_cast<BlockBasedTableOptions::PrepopulateBlockCache>(val);
+}
+
+int rocksdb_block_based_options_get_prepopulate_block_cache(
+    rocksdb_block_based_table_options_t* opt) {
+  return static_cast<int>(opt->rep.prepopulate_block_cache);
+}
+
 void rocksdb_options_set_block_based_table_factory(
     rocksdb_options_t* opt,
     rocksdb_block_based_table_options_t* table_options) {
